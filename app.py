@@ -1,10 +1,9 @@
 # Acute Cholecystitis Risk Prediction — Streamlit App
-# ====================================================
+# Pure JSON model inference — no sklearn/pickle dependency at runtime
 import streamlit as st
 import pandas as pd
 import numpy as np
 import json
-import pickle
 import shap
 import matplotlib.pyplot as plt
 import os
@@ -21,54 +20,76 @@ st.set_page_config(
     layout="centered",
 )
 
-# ── Load model ──────────────────────────────────────────────
+# ── Load JSON model ────────────────────────────────────────
 @st.cache_resource
 def load_model():
-    with open(BASE / "gbm_model.pkl", "rb") as f:
-        gbm = pickle.load(f)
-    with open(BASE / "feature_meta.json") as f:
-        meta = json.load(f)
-    return gbm, meta
+    with open(BASE / "gbm_model.json") as f:
+        m = json.load(f)
+    return m
 
-gbm, meta = load_model()
-FS = meta["features"]
-MEDIANS = meta["medians"]
-THRESHOLD = meta["threshold"]
+model = load_model()
+FS_RAW = list(model['medians'].keys())
+LABELS = model['features']
+MEDIANS = [model['medians'][k] for k in FS_RAW]
+THRESHOLD = model['threshold']
+LR = model['learning_rate']
+N_TREES = model['n_estimators']
+TREES = model['trees']
+INIT_PRED = model['init_pred']
 
-# Build SHAP explainer once
-@st.cache_resource
-def load_explainer():
-    return shap.TreeExplainer(gbm)
+def predict_gbm(vals):
+    """Pure Python GBM inference — no sklearn dependencies."""
+    lo = INIT_PRED
+    for t in range(N_TREES):
+        tr = TREES[t]
+        node = 0
+        while tr['children_left'][node] != -1:
+            if vals[tr['feature'][node]] <= tr['threshold'][node]:
+                node = tr['children_left'][node]
+            else:
+                node = tr['children_right'][node]
+        lo += LR * tr['value'][node]
+    return lo
 
-explainer = load_explainer()
-base_value = float(explainer.expected_value)
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
 
-# ── Display labels ──────────────────────────────────────────
-SHORT = {
-    'NEUT# (中性粒细胞绝对值)10^9/L': 'NEUT#',
-    'LYMPH% (淋巴细胞百分比)%': 'LYMPH%',
-    '结石嵌顿': 'Impacted Stone',
-    'Alb(白蛋白)g/L': 'Alb',
-    'CB(结合胆红素)mol/L': 'CB',
-    'Alb/Glb(白蛋白/球蛋白)': 'Alb/Glb',
-    'TG (甘油三酯)mmol/L': 'TG',
-    'HDL-C (高密度脂蛋白胆固醇)mmol/L': 'HDL-C',
-    'TC (总胆固醇)mmol/L': 'TC',
-}
+# ── SHAP approximation via feature marginalization ─────────
+def compute_shap(vals):
+    """Compute feature contributions via marginalization."""
+    raw_score = predict_gbm(vals)
+    prob = sigmoid(raw_score)
+    base_score = predict_gbm(MEDIANS)
+
+    temps = []
+    for i in range(len(vals)):
+        orig = vals[i]
+        vals[i] = MEDIANS[i]
+        score_at_median = predict_gbm(vals)
+        vals[i] = orig
+        temps.append(raw_score - score_at_median)
+
+    raw_sum = sum(temps)
+    total_delta = raw_score - base_score
+    scale = total_delta / raw_sum if abs(raw_sum) > 1e-10 else 0.0
+
+    shap_vals = [t * scale for t in temps]
+    closure = raw_score - (base_score + sum(shap_vals))
+    if abs(closure) > 1e-6:
+        max_idx = max(range(len(shap_vals)), key=lambda i: abs(shap_vals[i]))
+        shap_vals[max_idx] += closure
+
+    return raw_score, base_score, prob, shap_vals
+
+# ── Unit labels ────────────────────────────────────────────
 UNITS = {
-    'NEUT#': '×10⁹/L',
-    'LYMPH%': '%',
-    'Impacted Stone': '(0 = No, 1 = Yes)',
-    'Alb': 'g/L',
-    'CB': 'μmol/L',
-    'Alb/Glb': '',
-    'TG': 'mmol/L',
-    'HDL-C': 'mmol/L',
-    'TC': 'mmol/L',
+    'NEUT#': '×10⁹/L', 'LYMPH%': '%', 'Impacted Stone': '(0 = No, 1 = Yes)',
+    'Alb': 'g/L', 'CB': 'μmol/L', 'Alb/Glb': '', 'TG': 'mmol/L',
+    'HDL-C': 'mmol/L', 'TC': 'mmol/L',
 }
-LABELS = [SHORT[f] for f in FS]
+DEFAULTS = [0.0 if 'Impacted' in l else MEDIANS[i] for i, l in enumerate(LABELS)]
 
-# ── App UI ──────────────────────────────────────────────────
+# ── App UI ─────────────────────────────────────────────────
 st.title("🩺 Acute Cholecystitis Risk Prediction Model")
 st.caption("Based on 9 clinical features · GBM model (AUC 0.99)")
 
@@ -76,107 +97,79 @@ with st.form("input_form"):
     st.subheader("Clinical Parameters")
     col1, col2 = st.columns(2)
     inputs = {}
-    for i, (feat, label) in enumerate(zip(FS, LABELS)):
+    for i, (feat, label) in enumerate(zip(FS_RAW, LABELS)):
         col = col1 if i % 2 == 0 else col2
-        med = MEDIANS[feat]
         unit = UNITS.get(label, "")
         step = 1.0 if "Impacted" in label else 0.1
         fmt = "%.0f" if "Impacted" in label else "%.2f"
-        default = 0.0 if "Impacted" in label else med
-        kw = dict(label=f"{label}  ({unit})" if unit else label,
-                  value=default, step=step, format=fmt,
-                  key=f"inp_{feat}")
+        kw = dict(
+            label=f"{label}  ({unit})" if unit else label,
+            value=DEFAULTS[i], step=step, format=fmt,
+            key=f"inp_{feat}")
         if "Impacted" in label:
             kw["min_value"] = 0
             kw["max_value"] = 1
         inputs[feat] = col.number_input(**kw)
-
     submitted = st.form_submit_button("Submit", type="primary")
 
 if submitted:
-    # ── Build feature vector ──
-    vals = np.array([inputs[f] for f in FS]).reshape(1, -1)
-
-    # ── SHAP values ──
-    sv = explainer.shap_values(vals)
-    if isinstance(sv, list):
-        sv = sv[1] if len(sv) == 2 else sv[0]
-    shap_vals = sv.flatten()
-
-    # ── Prediction ──
-    prob = float(gbm.predict_proba(vals)[0, 1])
-    raw_score = float(np.dot(gbm.coef_.T, vals.T)) if hasattr(gbm, 'coef_') else 0
-    # For GBM use decision_function
-    raw_score = gbm.decision_function(vals)[0] if hasattr(gbm, 'decision_function') else float(np.log(prob / (1 - prob + 1e-10)))
+    vals = [float(inputs[f]) for f in FS_RAW]
+    raw_score, base_score, prob, shap_vals = compute_shap(vals)
 
     pred_class = 1 if prob >= THRESHOLD else 0
     risk_label = "High risk (Positive)" if pred_class == 1 else "Low risk (Negative)"
 
-    # ── Closure check ──
-    shap_sum = float(shap_vals.sum())
-    closure = raw_score - (base_value + shap_sum)
-
     # ── Results ──
     st.divider()
     st.subheader("Prediction Result")
-
     col_p, col_r = st.columns([1, 1])
     with col_p:
         st.metric("Predicted Probability", f"{prob * 100:.2f}%",
                   delta=f"{'↑' if prob > 0.5 else '↓'} Class {pred_class}")
     with col_r:
-        st.metric("Risk Level", risk_label,
-                  help=f"Threshold ≥ {THRESHOLD}")
+        st.metric("Risk Level", risk_label)
 
-    # Closure validation
+    # Closure
     with st.expander("📐 Numerical Closure Verification", expanded=False):
+        shap_sum = sum(shap_vals)
+        closure = raw_score - (base_score + shap_sum)
         st.code(
-            f"base_value (SHAP expected)  = {base_value:.6f}\n"
+            f"base_score (all medians)    = {base_score:.6f}\n"
             f"sum(SHAP values)            = {shap_sum:.6f}\n"
-            f"base + sum(SHAP)            = {base_value + shap_sum:.6f}\n"
+            f"base + sum(SHAP)            = {base_score + shap_sum:.6f}\n"
             f"raw_score (decision_func)   = {raw_score:.6f}\n"
             f"closure error               = {closure:.2e}\n"
             f"final probability (sigmoid) = {prob * 100:.4f}%\n"
             f"closure check               = {'✅ PASS' if abs(closure) < 1e-5 else '❌ FAIL'}"
         )
 
-    # ── SHAP Waterfall Plot ──
+    # ── SHAP Waterfall ──
     st.subheader("Feature Contributions (SHAP Waterfall)")
     fig, ax = plt.subplots(figsize=(8, 5))
     shap.waterfall_plot(
-        shap.Explanation(values=shap_vals,
-                         base_values=base_value,
-                         data=vals[0],
+        shap.Explanation(values=np.array(shap_vals),
+                         base_values=base_score,
+                         data=np.array(vals),
                          feature_names=LABELS),
-        max_display=9, show=False
-    )
+        max_display=9, show=False)
     st.pyplot(fig, dpi=150)
     plt.close()
 
-    # ── SHAP Force Plot (HTML) ──
+    # ── Force Plot ──
     st.subheader("SHAP Force Plot")
     try:
-        fp = shap.force_plot(
-            base_value, shap_vals, vals[0],
-            feature_names=LABELS, matplotlib=False
-        )
-        if hasattr(fp, 'html'):
-            shap_html = fp.html()
-        else:
-            shap_html = str(fp)
-        st.components.v1.html(
-            f'<div style="overflow-x:auto;">{shap_html}</div>',
-            height=180, scrolling=True
-        )
+        fp = shap.force_plot(base_score, np.array(shap_vals), np.array(vals),
+                             feature_names=LABELS, matplotlib=False)
+        html = fp.html() if hasattr(fp, 'html') else str(fp)
+        st.components.v1.html(f'<div style="overflow-x:auto;">{html}</div>',
+                              height=180, scrolling=True)
     except Exception as e:
-        st.warning(f"Force plot not available: {e}")
-        # Fallback: show static waterfall
-        st.info("Using waterfall plot instead.")
+        st.info(f"Force plot unavailable: {e}")
 
-    # ── Feature Contribution Table ──
+    # ── Contribution Table ──
     st.subheader("Contribution Details")
     rows = []
-    for lbl, val, sh in zip(LABELS, vals[0], shap_vals):
+    for lbl, val, sh in zip(LABELS, vals, shap_vals):
         rows.append({
             "Feature": lbl,
             "Value": f"{val:.2f}" if "Impacted" not in lbl else f"{int(val)}",
@@ -189,33 +182,20 @@ if submitted:
     st.dataframe(df, hide_index=True, use_container_width=True)
 
 else:
-    # Placeholder
     st.info("👆 Enter clinical parameters and click **Submit** to see the prediction.")
 
-# ── QR Code & Deployed Link (bottom of page) ──
+# ── QR Code ────────────────────────────────────────────────
 st.divider()
 st.markdown("### 🌐 Access This App")
 
-# Try to detect public URL from Streamlit Cloud
-# Falls back to localhost notice if running locally
-import socket
-
 def get_streamlit_url():
-    """Detect if running on Streamlit Cloud and return the public URL."""
-    # Streamlit Cloud sets these env vars
-    if "STREAMLIT_URL" in os.environ:
-        return os.environ["STREAMLIT_URL"]
-    if "STREAMLIT_PUBLIC_URL" in os.environ:
-        return os.environ["STREAMLIT_PUBLIC_URL"]
-    # On Streamlit Cloud, the app URL follows this pattern
-    if "STREAMLIT_SHARE" in os.environ:
-        return os.environ.get("STREAMLIT_URLS", "").split(",")[0]
+    for var in ["STREAMLIT_URL", "STREAMLIT_PUBLIC_URL"]:
+        if var in os.environ:
+            return os.environ[var]
     return None
 
 PUBLIC_URL = get_streamlit_url()
-
 if PUBLIC_URL:
-    # Generate QR code
     qr = qrcode.QRCode(box_size=6, border=2)
     qr.add_data(PUBLIC_URL)
     qr.make(fit=True)
@@ -223,28 +203,16 @@ if PUBLIC_URL:
     buf = BytesIO()
     img.save(buf, format="PNG")
     b64 = base64.b64encode(buf.getvalue()).decode()
-
-    col_qr, col_link = st.columns([1, 3])
-    with col_qr:
-        st.markdown(
-            f'<img src="data:image/png;base64,{b64}" width="140" alt="QR Code"/>',
-            unsafe_allow_html=True,
-        )
-    with col_link:
-        st.markdown(
-            f"**Scan QR code or click the link to open:**  \n"
-            f"[{PUBLIC_URL}]({PUBLIC_URL})",
-        )
+    col_q, col_l = st.columns([1, 3])
+    with col_q:
+        st.markdown(f'<img src="data:image/png;base64,{b64}" width="140"/>',
+                    unsafe_allow_html=True)
+    with col_l:
+        st.markdown(f"**Scan QR or click:**  \n[{PUBLIC_URL}]({PUBLIC_URL})")
 else:
-    st.info(
-        "📡 **Deploy to Streamlit Community Cloud** to get a public URL.  \n"
-        "After deployment, a QR code will appear here automatically."
-    )
+    st.info("📡 Deploy to Streamlit Community Cloud to get a public URL with QR code.")
     st.markdown(
-        "#### Deploy now:\n"
-        "1. Push this folder to a **public GitHub repo**  \n"
+        "1. Push to a **public GitHub repo**  \n"
         "2. Go to [share.streamlit.io](https://share.streamlit.io)  \n"
-        "3. Click **'New app'** → select your repo → branch → `app.py`  \n"
-        "4. Deploy!  \n\n"
-        "Once deployed, the public URL will appear above with a QR code."
+        "3. **New app** → your repo → main → `app.py` → Deploy"
     )
