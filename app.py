@@ -91,7 +91,6 @@ DEFAULTS = [0.0 if 'Impacted' in l else float(MEDIANS[i]) for i, l in enumerate(
 
 # ── App UI ─────────────────────────────────────────────────
 st.title("🩺 Acute Cholecystitis Risk Prediction Model")
-st.caption("Based on 9 clinical features · GBM model (AUC 0.99)")
 
 with st.form("input_form"):
     st.subheader("Clinical Parameters")
@@ -142,18 +141,6 @@ if submitted:
             f"final probability (sigmoid) = {prob * 100:.4f}%\n"
             f"closure check               = {'✅ PASS' if abs(closure) < 1e-5 else '❌ FAIL'}"
         )
-
-    # ── SHAP Waterfall ──
-    st.subheader("Feature Contributions (SHAP Waterfall)")
-    fig, ax = plt.subplots(figsize=(8, 5))
-    shap.waterfall_plot(
-        shap.Explanation(values=np.array(shap_vals),
-                         base_values=base_score,
-                         data=np.array(vals),
-                         feature_names=LABELS),
-        max_display=9, show=False)
-    st.pyplot(fig, dpi=150)
-    plt.close()
 
     # ── Force Plot ──
     st.subheader("SHAP Force Plot")
