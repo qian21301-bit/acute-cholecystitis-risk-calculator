@@ -4,7 +4,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import json
-import joblib
+import pickle
 import shap
 import matplotlib.pyplot as plt
 import os
@@ -24,7 +24,8 @@ st.set_page_config(
 # ── Load model ──────────────────────────────────────────────
 @st.cache_resource
 def load_model():
-    gbm = joblib.load(BASE / "gbm_model.joblib")
+    with open(BASE / "gbm_model.pkl", "rb") as f:
+        gbm = pickle.load(f)
     with open(BASE / "feature_meta.json") as f:
         meta = json.load(f)
     return gbm, meta
