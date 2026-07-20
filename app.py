@@ -87,7 +87,7 @@ UNITS = {
     'Alb': 'g/L', 'CB': 'μmol/L', 'Alb/Glb': '', 'TG': 'mmol/L',
     'HDL-C': 'mmol/L', 'TC': 'mmol/L',
 }
-DEFAULTS = [0.0 if 'Impacted' in l else MEDIANS[i] for i, l in enumerate(LABELS)]
+DEFAULTS = [0.0 if 'Impacted' in l else float(MEDIANS[i]) for i, l in enumerate(LABELS)]
 
 # ── App UI ─────────────────────────────────────────────────
 st.title("🩺 Acute Cholecystitis Risk Prediction Model")
@@ -107,8 +107,8 @@ with st.form("input_form"):
             value=DEFAULTS[i], step=step, format=fmt,
             key=f"inp_{feat}")
         if "Impacted" in label:
-            kw["min_value"] = 0
-            kw["max_value"] = 1
+            kw["min_value"] = 0.0
+            kw["max_value"] = 1.0
         inputs[feat] = col.number_input(**kw)
     submitted = st.form_submit_button("Submit", type="primary")
 
